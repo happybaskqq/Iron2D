@@ -1,0 +1,3560 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+          content="width=device-width, initial-scale=1.0, user-scalable=no">
+
+    <title>铁囚 CP-01：峡口中继站</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        html,
+        body {
+            width: 100%;
+            height: 100%;
+            margin: 0;
+            overflow: hidden;
+            background: #080b0d;
+            color: #e7f4ef;
+            font-family: "Microsoft YaHei", Arial, sans-serif;
+        }
+
+        body {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        }
+
+        canvas {
+            display: block;
+            width: 100vw;
+            height: 100vh;
+            background: #111719;
+            cursor: crosshair;
+        }
+
+        #controls {
+            position: fixed;
+            left: 12px;
+            bottom: 12px;
+            padding: 9px 12px;
+            border: 1px solid rgba(100, 220, 180, 0.28);
+            border-radius: 5px;
+            background: rgba(4, 8, 10, 0.79);
+            color: rgba(225, 245, 238, 0.86);
+            font-size: 12px;
+            line-height: 1.75;
+            pointer-events: none;
+            user-select: none;
+        }
+
+        #controls strong {
+            color: #7ce7be;
+        }
+    </style>
+</head>
+
+<body>
+
+<canvas id="game" width="1200" height="800"></canvas>
+
+<div id="controls">
+    <strong>WASD</strong> 移动　
+    <strong>Shift</strong> 冲刺　
+    <strong>鼠标左键</strong> 射击<br>
+    <strong>1/2</strong> 步枪/散射炮　
+    <strong>R</strong> 换弹　
+    <strong>F</strong> 近战　
+    <strong>G</strong> 手雷<br>
+    <strong>Z</strong> 标记　
+    <strong>X</strong> 过载　
+    <strong>C</strong> 微型炮台<br>
+    <strong>Q/E</strong> 重机枪塔/链锯塔　
+    <strong>Enter</strong> 开始防守<br>
+    <strong>L</strong> 导出日志　
+    <strong>N</strong> 重开　
+    <strong>F8</strong> 时间倍率
+</div>
+
+<script>
+"use strict";
+
+/* =========================================================
+   1. 基础配置
+   ========================================================= */
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+const W = canvas.width;
+const H = canvas.height;
+const TAU = Math.PI * 2;
+
+const keys = new Set();
+
+const mouse = {
+    x: W / 2,
+    y: H / 2,
+    down: false
+};
+
+let lastTime = performance.now();
+let gameTime = 0;
+let timeScale = 1;
+
+const CONFIG = {
+    player: {
+        maxHealth: 100,
+        radius: 13,
+        speed: 185,
+        sprintMultiplier: 1.5
+    },
+
+    core: {
+        maxHealth: 1000,
+        radius: 35
+    },
+
+    rifle: {
+        magazine: 36,
+        reserve: 216,
+        damage: 18,
+        fireInterval: 0.11,
+        reloadTime: 1.55,
+        bulletSpeed: 720,
+        spread: 0.025
+    },
+
+    scatter: {
+        magazine: 6,
+        reserve: 30,
+        bodyDamage: 10,
+        armorDamage: 17,
+        pellets: 8,
+        fireInterval: 0.72,
+        reloadTime: 1.9,
+        bulletSpeed: 610,
+        spread: 0.24
+    },
+
+    grenade: {
+        charges: 2,
+        fuse: 0.75,
+        radius: 85,
+        damage: 100,
+        armorDamage: 95
+    },
+
+    mark: {
+        duration: 8,
+        cooldown: 20,
+        damageMultiplier: 1.5
+    },
+
+    overload: {
+        duration: 8,
+        cooldown: 30,
+        fireRateMultiplier: 1.85,
+        damageMultiplier: 1.25
+    },
+
+    miniTurret: {
+        charges: 1,
+        duration: 20,
+        range: 190,
+        fireInterval: 0.2,
+        damage: 10
+    },
+
+    machineGunTower: {
+        maxHealth: 320,
+        radius: 20,
+        range: 300,
+        fireInterval: 0.115,
+        damage: 14,
+        bulletSpeed: 650,
+        turnSpeed: 2.8
+    },
+
+    sawTower: {
+        maxHealth: 420,
+        radius: 23,
+        range: 49,
+        damagePerSecond: 105,
+        armorMultiplier: 0.18,
+        pushStrength: 32
+    }
+};
+
+/*
+    为方便快速测试，默认总流程约 5～7 分钟。
+    如果希望接近文档中的 10～15 分钟，可将 duration 整体乘以 1.8～2。
+*/
+const PHASES = [
+    {
+        id: "deploy",
+        name: "阶段0：建立防线",
+        duration: Infinity,
+        objective: "在两个部署区放置重机枪塔和链锯塔，然后按 Enter 开始。"
+    },
+    {
+        id: "basic",
+        name: "阶段1：基础压力",
+        duration: 42,
+        objective: "观察大型塔能否稳定承担正面工蚁虫压力。"
+    },
+    {
+        id: "leaper",
+        name: "阶段2：侧路跃袭",
+        duration: 50,
+        objective: "处理越过链锯防线、落入核心后方的跃袭虫。"
+    },
+    {
+        id: "armor",
+        name: "阶段3：装甲目标",
+        duration: 55,
+        objective: "使用散射炮破坏裂甲虫装甲，再让塔集中输出。"
+    },
+    {
+        id: "artillery",
+        name: "阶段4：越界炮火",
+        duration: 72,
+        objective: "炮虫位于塔射程外。离开基地，沿掩体路线前出消灭它。"
+    },
+    {
+        id: "final",
+        name: "阶段5：综合考试",
+        duration: 85,
+        objective: "在正面、侧路、装甲目标和炮虫之间判断威胁优先级。"
+    }
+];
+
+/* =========================================================
+   2. 地图
+   ========================================================= */
+
+const core = {
+    x: 590,
+    y: 714,
+    radius: CONFIG.core.radius,
+    health: CONFIG.core.maxHealth,
+    maxHealth: CONFIG.core.maxHealth
+};
+
+const deploymentPads = [
+    {
+        id: "D1",
+        label: "正面部署区",
+        x: 590,
+        y: 510,
+        radius: 37,
+        tower: null,
+        recommended: "mg"
+    },
+    {
+        id: "D2",
+        label: "侧路部署区",
+        x: 350,
+        y: 630,
+        radius: 37,
+        tower: null,
+        recommended: "saw"
+    }
+];
+
+const highland = {
+    x: 1025,
+    y: 165,
+    radius: 72
+};
+
+const obstacles = [
+    // 正面路线岩石
+    { x: 485, y: 185, w: 75, h: 38 },
+    { x: 655, y: 280, w: 90, h: 42 },
+    { x: 475, y: 375, w: 68, h: 36 },
+
+    // 侧路墙体
+    { x: 170, y: 475, w: 135, h: 25 },
+    { x: 305, y: 475, w: 25, h: 100 },
+    { x: 225, y: 575, w: 105, h: 25 },
+
+    // 炮虫前出路线掩体
+    { x: 700, y: 595, w: 65, h: 35 },
+    { x: 795, y: 480, w: 70, h: 35 },
+    { x: 865, y: 350, w: 72, h: 35 },
+    { x: 930, y: 245, w: 62, h: 34 },
+
+    // 基地低矮掩体
+    { x: 475, y: 690, w: 50, h: 24 },
+    { x: 655, y: 690, w: 50, h: 24 }
+];
+
+const supplyPoint = {
+    x: 420,
+    y: 730,
+    radius: 22,
+    cooldown: 0
+};
+
+/* =========================================================
+   3. 游戏状态
+   ========================================================= */
+
+let player;
+let enemies;
+let towers;
+let bullets;
+let grenades;
+let explosions;
+let mortarWarnings;
+let particles;
+let floatingTexts;
+let notices;
+
+let phaseIndex;
+let phaseTime;
+let spawnTimers;
+let selectedTowerType;
+let gameState;
+let screenShake;
+
+let enemySerial = 0;
+
+let stats;
+
+/* =========================================================
+   4. 工具函数
+   ========================================================= */
+
+function clamp(v, min, max) {
+    return Math.max(min, Math.min(max, v));
+}
+
+function distance(ax, ay, bx, by) {
+    return Math.hypot(bx - ax, by - ay);
+}
+
+function normalize(x, y) {
+    const length = Math.hypot(x, y);
+
+    if (length < 0.0001) {
+        return { x: 0, y: 0 };
+    }
+
+    return {
+        x: x / length,
+        y: y / length
+    };
+}
+
+function angleDiff(a, b) {
+    let d = a - b;
+
+    while (d > Math.PI) d -= TAU;
+    while (d < -Math.PI) d += TAU;
+
+    return d;
+}
+
+function lerpAngle(current, target, amount) {
+    return current + angleDiff(target, current) * clamp(amount, 0, 1);
+}
+
+function randomRange(min, max) {
+    return min + Math.random() * (max - min);
+}
+
+function pointInRect(x, y, rect) {
+    return (
+        x >= rect.x &&
+        x <= rect.x + rect.w &&
+        y >= rect.y &&
+        y <= rect.y + rect.h
+    );
+}
+
+function circleRectCollision(x, y, radius, rect) {
+    const nearestX = clamp(x, rect.x, rect.x + rect.w);
+    const nearestY = clamp(y, rect.y, rect.y + rect.h);
+    const dx = x - nearestX;
+    const dy = y - nearestY;
+
+    return dx * dx + dy * dy < radius * radius;
+}
+
+function screenToWorld(clientX, clientY) {
+    const rect = canvas.getBoundingClientRect();
+
+    return {
+        x: (clientX - rect.left) * canvas.width / rect.width,
+        y: (clientY - rect.top) * canvas.height / rect.height
+    };
+}
+
+function formatTime(seconds) {
+    const s = Math.max(0, Math.ceil(seconds));
+    const m = Math.floor(s / 60);
+    const r = s % 60;
+
+    return `${m}:${String(r).padStart(2, "0")}`;
+}
+
+function drawBar(x, y, width, height, current, max, color) {
+    const ratio = clamp(current / max, 0, 1);
+
+    ctx.fillStyle = "rgba(0,0,0,0.72)";
+    ctx.fillRect(x, y, width, height);
+
+    ctx.fillStyle = color;
+    ctx.fillRect(x + 1, y + 1, (width - 2) * ratio, height - 2);
+}
+
+function addText(x, y, text, color = "#fff", life = 0.85) {
+    floatingTexts.push({
+        x,
+        y,
+        text,
+        color,
+        life,
+        maxLife: life
+    });
+}
+
+function addNotice(text, color = "#f6e39a", duration = 3) {
+    notices.push({
+        text,
+        color,
+        life: duration,
+        maxLife: duration
+    });
+}
+
+function addBurst(x, y, color, amount = 7) {
+    for (let i = 0; i < amount; i++) {
+        const a = Math.random() * TAU;
+        const speed = randomRange(35, 150);
+
+        particles.push({
+            x,
+            y,
+            vx: Math.cos(a) * speed,
+            vy: Math.sin(a) * speed,
+            radius: randomRange(1.5, 3.7),
+            life: randomRange(0.25, 0.65),
+            maxLife: 0.65,
+            color
+        });
+    }
+}
+
+function phase() {
+    return PHASES[phaseIndex];
+}
+
+function isSpecialEnemy(enemy) {
+    return (
+        enemy.type === "leaper" ||
+        enemy.type === "armored" ||
+        enemy.type === "artillery"
+    );
+}
+
+/* =========================================================
+   5. 初始化与统计
+   ========================================================= */
+
+function createStats() {
+    return {
+        startedAt: new Date().toISOString(),
+
+        playTime: 0,
+        deploymentTime: 0,
+
+        kills: {
+            player: 0,
+            mgTower: 0,
+            sawTower: 0,
+            miniTurret: 0,
+            grenade: 0,
+            other: 0
+        },
+
+        killsByType: {
+            grunt: {
+                total: 0,
+                player: 0,
+                tower: 0
+            },
+            leaper: {
+                total: 0,
+                playerInvolved: 0
+            },
+            armored: {
+                total: 0,
+                playerInvolved: 0
+            },
+            artillery: {
+                total: 0,
+                playerInvolved: 0
+            }
+        },
+
+        playerDamageByType: {
+            grunt: 0,
+            leaper: 0,
+            armored: 0,
+            artillery: 0
+        },
+
+        coreDamageBySource: {
+            grunt: 0,
+            leaper: 0,
+            armored: 0,
+            artillery: 0
+        },
+
+        armorBreaks: 0,
+        armorKillTimes: [],
+
+        artillerySpawnTimes: {},
+        artilleryLifeTimes: [],
+
+        leapersSpawned: 0,
+        leapersLandedBehind: 0,
+
+        marksUsed: 0,
+        overloadsUsed: 0,
+        grenadesUsed: 0,
+        miniTurretsUsed: 0,
+
+        reloads: 0,
+        meleeUses: 0,
+
+        playerTransfers: 0,
+        lastPlayerZone: "base",
+
+        longestAwayTime: 0,
+        currentAwayTime: 0,
+
+        phaseResults: [],
+        eventLog: []
+    };
+}
+
+function logEvent(type, detail = {}) {
+    stats.eventLog.push({
+        time: Number(gameTime.toFixed(2)),
+        phase: phase().id,
+        type,
+        ...detail
+    });
+}
+
+function resetGame() {
+    player = {
+        x: 590,
+        y: 750,
+        radius: CONFIG.player.radius,
+        health: CONFIG.player.maxHealth,
+        maxHealth: CONFIG.player.maxHealth,
+
+        angle: -Math.PI / 2,
+        weapon: "rifle",
+
+        rifleMagazine: CONFIG.rifle.magazine,
+        rifleReserve: CONFIG.rifle.reserve,
+
+        scatterMagazine: CONFIG.scatter.magazine,
+        scatterReserve: CONFIG.scatter.reserve,
+
+        grenades: CONFIG.grenade.charges,
+        miniTurrets: CONFIG.miniTurret.charges,
+
+        fireCooldown: 0,
+        reloadTimer: 0,
+        meleeCooldown: 0,
+
+        markCooldown: 0,
+        overloadCooldown: 0,
+
+        invulnerability: 0
+    };
+
+    enemies = [];
+    towers = [];
+    bullets = [];
+    grenades = [];
+    explosions = [];
+    mortarWarnings = [];
+    particles = [];
+    floatingTexts = [];
+    notices = [];
+
+    deploymentPads.forEach(pad => {
+        pad.tower = null;
+    });
+
+    phaseIndex = 0;
+    phaseTime = 0;
+    gameTime = 0;
+
+    spawnTimers = {
+        front: 1,
+        side: 4,
+        special: 8,
+        artillery: 2
+    };
+
+    selectedTowerType = "mg";
+    gameState = "playing";
+    screenShake = 0;
+
+    enemySerial = 0;
+    stats = createStats();
+
+    addNotice("部署重机枪塔和链锯塔，然后按 Enter 开始", "#7ce7be", 6);
+}
+
+/* =========================================================
+   6. 塔部署
+   ========================================================= */
+
+function placeSelectedTower() {
+    if (phase().id !== "deploy" || gameState !== "playing") {
+        return;
+    }
+
+    let closestPad = null;
+    let closestDistance = Infinity;
+
+    for (const pad of deploymentPads) {
+        const d = distance(mouse.x, mouse.y, pad.x, pad.y);
+
+        if (d < pad.radius + 24 && d < closestDistance) {
+            closestPad = pad;
+            closestDistance = d;
+        }
+    }
+
+    if (!closestPad) {
+        addNotice("只能在圆形大型塔部署区投放", "#ffb66d", 1.5);
+        return;
+    }
+
+    if (closestPad.tower) {
+        addNotice("该部署区已有大型塔", "#ffb66d", 1.5);
+        return;
+    }
+
+    if (towers.some(t => t.type === selectedTowerType && !t.mini)) {
+        addNotice("该类型大型塔已部署", "#ffb66d", 1.5);
+        return;
+    }
+
+    const tower = {
+        type: selectedTowerType,
+        x: closestPad.x,
+        y: closestPad.y,
+        angle: -Math.PI / 2,
+        cooldown: 0,
+        overloadTimer: 0,
+        mini: false,
+        life: Infinity,
+
+        radius: selectedTowerType === "mg"
+            ? CONFIG.machineGunTower.radius
+            : CONFIG.sawTower.radius,
+
+        health: selectedTowerType === "mg"
+            ? CONFIG.machineGunTower.maxHealth
+            : CONFIG.sawTower.maxHealth,
+
+        maxHealth: selectedTowerType === "mg"
+            ? CONFIG.machineGunTower.maxHealth
+            : CONFIG.sawTower.maxHealth
+    };
+
+    towers.push(tower);
+    closestPad.tower = tower;
+
+    logEvent("tower_placed", {
+        tower: selectedTowerType,
+        pad: closestPad.id,
+        recommended: closestPad.recommended === selectedTowerType
+    });
+
+    addBurst(tower.x, tower.y, "#71dcb3", 15);
+    addNotice(
+        selectedTowerType === "mg"
+            ? "重机枪塔部署完成"
+            : "链锯拒止塔部署完成",
+        "#7ce7be",
+        2
+    );
+}
+
+function startDefense() {
+    if (phase().id !== "deploy") {
+        return;
+    }
+
+    const hasMG = towers.some(t => t.type === "mg" && !t.mini);
+    const hasSaw = towers.some(t => t.type === "saw" && !t.mini);
+
+    if (!hasMG || !hasSaw) {
+        addNotice("需要先部署重机枪塔和链锯塔", "#ff9d76", 2);
+        return;
+    }
+
+    stats.deploymentTime = gameTime;
+    nextPhase();
+}
+
+/* =========================================================
+   7. 敌人
+   ========================================================= */
+
+function enemyConfig(type) {
+    const table = {
+        grunt: {
+            radius: 11,
+            maxHealth: 62,
+            speed: 53,
+            damage: 8,
+            attackInterval: 0.8,
+            color: "#d75b49"
+        },
+
+        leaper: {
+            radius: 10,
+            maxHealth: 48,
+            speed: 78,
+            damage: 50,
+            attackInterval: 1.1,
+            color: "#f4aa45"
+        },
+
+        armored: {
+            radius: 17,
+            maxHealth: 220,
+            armor: 150,
+            speed: 35,
+            damage: 120,
+            attackInterval: 2.2,
+            color: "#8d73c7"
+        },
+
+        artillery: {
+            radius: 22,
+            maxHealth: 320,
+            armor: 80,
+            speed: 0,
+            damage: 150,
+            attackInterval: 5.2,
+            color: "#d86ca9"
+        }
+    };
+
+    return table[type];
+}
+
+function spawnEnemy(type, lane = "front") {
+    const cfg = enemyConfig(type);
+
+    let x;
+    let y;
+    let path;
+
+    if (type === "artillery") {
+        x = highland.x;
+        y = highland.y;
+
+        path = [];
+
+        // 防止同一时刻生成重复炮虫
+        const existing = enemies.some(e =>
+            e.type === "artillery" && !e.dead
+        );
+
+        if (existing) {
+            return null;
+        }
+    } else if (lane === "side") {
+        x = randomRange(75, 120);
+        y = randomRange(405, 445);
+
+        path = [
+            { x: 205, y: 430 },
+            { x: 285, y: 450 },
+            { x: 285, y: 610 },
+            { x: 430, y: 640 },
+            { x: 570, y: 690 }
+        ];
+    } else {
+        x = randomRange(515, 670);
+        y = randomRange(45, 75);
+
+        path = [
+            { x: randomRange(535, 655), y: 170 },
+            { x: randomRange(530, 650), y: 330 },
+            { x: randomRange(535, 645), y: 485 },
+            { x: randomRange(545, 635), y: 640 },
+            { x: 590, y: 690 }
+        ];
+    }
+
+    const enemy = {
+        id: ++enemySerial,
+        type,
+        lane,
+
+        x,
+        y,
+        radius: cfg.radius,
+
+        health: cfg.maxHealth,
+        maxHealth: cfg.maxHealth,
+
+        armor: cfg.armor || 0,
+        maxArmor: cfg.armor || 0,
+
+        speed: cfg.speed,
+        damage: cfg.damage,
+        attackInterval: cfg.attackInterval,
+        attackCooldown: randomRange(0.2, 0.8),
+
+        color: cfg.color,
+
+        path,
+        pathIndex: 0,
+
+        markedTimer: 0,
+        playerDamage: 0,
+        spawnTime: gameTime,
+        armorBrokenTime: null,
+
+        leapState: "none",
+        leapTimer: 0,
+
+        artilleryCooldown: 2.8,
+
+        dead: false
+    };
+
+    enemies.push(enemy);
+
+    if (type === "leaper") {
+        stats.leapersSpawned++;
+    }
+
+    if (type === "artillery") {
+        stats.artillerySpawnTimes[enemy.id] = gameTime;
+
+        addNotice(
+            "警告：虫巢炮虫正在射程外轰击！必须主动前出！",
+            "#ff6b70",
+            5
+        );
+
+        logEvent("artillery_spawned", {
+            enemyId: enemy.id
+        });
+    }
+
+    return enemy;
+}
+
+/* =========================================================
+   8. 阶段系统
+   ========================================================= */
+
+function nextPhase() {
+    if (phaseIndex >= PHASES.length - 1) {
+        finishGame(true);
+        return;
+    }
+
+    stats.phaseResults.push({
+        phase: phase().id,
+        endedAt: Number(gameTime.toFixed(2)),
+        coreHealth: Math.round(core.health),
+        playerHealth: Math.round(player.health)
+    });
+
+    phaseIndex++;
+    phaseTime = 0;
+
+    spawnTimers.front = 0.8;
+    spawnTimers.side = 3.5;
+    spawnTimers.special = 7;
+    spawnTimers.artillery = 2;
+
+    addNotice(PHASES[phaseIndex].name, "#8cebd0", 4);
+    addNotice(PHASES[phaseIndex].objective, "#f3e7a2", 5);
+
+    logEvent("phase_started", {
+        phaseId: phase().id
+    });
+
+    if (phase().id === "artillery") {
+        spawnTimers.artillery = 3;
+    }
+
+    if (phase().id === "final") {
+        spawnTimers.artillery = 15;
+    }
+}
+
+function updatePhase(dt) {
+    if (phase().id === "deploy") {
+        return;
+    }
+
+    phaseTime += dt;
+
+    const p = phase();
+
+    spawnTimers.front -= dt;
+    spawnTimers.side -= dt;
+    spawnTimers.special -= dt;
+    spawnTimers.artillery -= dt;
+
+    if (p.id === "basic") {
+        if (spawnTimers.front <= 0) {
+            spawnEnemy("grunt", "front");
+            spawnTimers.front = randomRange(1.0, 1.45);
+        }
+    }
+
+    if (p.id === "leaper") {
+        if (spawnTimers.front <= 0) {
+            spawnEnemy("grunt", Math.random() < 0.18 ? "side" : "front");
+            spawnTimers.front = randomRange(0.9, 1.3);
+        }
+
+        if (spawnTimers.special <= 0) {
+            spawnEnemy("leaper", "side");
+            spawnTimers.special = randomRange(6.2, 8.2);
+            addNotice("侧路侦测到跃袭虫", "#ffb15c", 1.8);
+        }
+    }
+
+    if (p.id === "armor") {
+        if (spawnTimers.front <= 0) {
+            spawnEnemy("grunt", Math.random() < 0.28 ? "side" : "front");
+            spawnTimers.front = randomRange(1.05, 1.5);
+        }
+
+        if (spawnTimers.special <= 0) {
+            spawnEnemy("armored", "front");
+            spawnTimers.special = randomRange(10, 13);
+            addNotice("正面发现裂甲虫：使用散射炮破甲", "#bf9dff", 2.5);
+        }
+
+        if (spawnTimers.side <= 0) {
+            spawnEnemy("leaper", "side");
+            spawnTimers.side = randomRange(11, 15);
+        }
+    }
+
+    if (p.id === "artillery") {
+        if (spawnTimers.artillery <= 0) {
+            spawnEnemy("artillery", "highland");
+            spawnTimers.artillery = 9999;
+        }
+
+        if (spawnTimers.front <= 0) {
+            spawnEnemy("grunt", Math.random() < 0.2 ? "side" : "front");
+            spawnTimers.front = randomRange(1.3, 1.8);
+        }
+
+        /*
+            首次炮虫事件前半段不生成大量跃袭虫；
+            让玩家先清楚理解“必须前出”。
+        */
+        if (phaseTime > 25 && spawnTimers.side <= 0) {
+            spawnEnemy("leaper", "side");
+            spawnTimers.side = randomRange(10, 14);
+            addNotice("后方出现局部缺口：尽快回防", "#ffb15c", 2.5);
+        }
+    }
+
+    if (p.id === "final") {
+        if (spawnTimers.front <= 0) {
+            const roll = Math.random();
+
+            if (roll < 0.18) {
+                spawnEnemy("armored", "front");
+            } else {
+                spawnEnemy(
+                    "grunt",
+                    Math.random() < 0.25 ? "side" : "front"
+                );
+            }
+
+            spawnTimers.front = randomRange(0.75, 1.2);
+        }
+
+        if (spawnTimers.side <= 0) {
+            spawnEnemy("leaper", "side");
+            spawnTimers.side = randomRange(7, 10);
+            addNotice("跃袭虫正在接近后方", "#ffb15c", 1.7);
+        }
+
+        if (spawnTimers.artillery <= 0) {
+            spawnEnemy("artillery", "highland");
+            spawnTimers.artillery = randomRange(30, 38);
+        }
+
+        if (spawnTimers.special <= 0) {
+            spawnEnemy("armored", "front");
+            spawnTimers.special = randomRange(13, 17);
+        }
+    }
+
+    if (phaseTime >= p.duration) {
+        const artilleryAlive = enemies.some(e =>
+            e.type === "artillery" && !e.dead
+        );
+
+        const meaningfulEnemies = enemies.filter(e =>
+            !e.dead && (
+                e.type === "armored" ||
+                e.type === "leaper" ||
+                e.type === "artillery"
+            )
+        );
+
+        if (!artilleryAlive && meaningfulEnemies.length === 0) {
+            nextPhase();
+        }
+    }
+}
+
+/* =========================================================
+   9. 玩家武器
+   ========================================================= */
+
+function playerShoot() {
+    if (
+        gameState !== "playing" ||
+        phase().id === "deploy" ||
+        player.reloadTimer > 0 ||
+        player.fireCooldown > 0
+    ) {
+        return;
+    }
+
+    if (player.weapon === "rifle") {
+        if (player.rifleMagazine <= 0) {
+            startReload();
+            return;
+        }
+
+        player.rifleMagazine--;
+        player.fireCooldown = CONFIG.rifle.fireInterval;
+
+        const angle =
+            player.angle +
+            randomRange(-CONFIG.rifle.spread, CONFIG.rifle.spread);
+
+        createBullet(
+            player.x + Math.cos(angle) * 17,
+            player.y + Math.sin(angle) * 17,
+            angle,
+            CONFIG.rifle.bulletSpeed,
+            CONFIG.rifle.damage,
+            "playerRifle",
+            2.8
+        );
+
+        addBurst(
+            player.x + Math.cos(angle) * 17,
+            player.y + Math.sin(angle) * 17,
+            "#e4f6c5",
+            2
+        );
+    } else {
+        if (player.scatterMagazine <= 0) {
+            startReload();
+            return;
+        }
+
+        player.scatterMagazine--;
+        player.fireCooldown = CONFIG.scatter.fireInterval;
+
+        for (let i = 0; i < CONFIG.scatter.pellets; i++) {
+            const angle =
+                player.angle +
+                randomRange(
+                    -CONFIG.scatter.spread,
+                    CONFIG.scatter.spread
+                );
+
+            createBullet(
+                player.x + Math.cos(angle) * 18,
+                player.y + Math.sin(angle) * 18,
+                angle,
+                CONFIG.scatter.bulletSpeed * randomRange(0.88, 1.05),
+                CONFIG.scatter.bodyDamage,
+                "playerScatter",
+                0.55,
+                CONFIG.scatter.armorDamage
+            );
+        }
+
+        screenShake = Math.max(screenShake, 4);
+    }
+}
+
+function createBullet(
+    x,
+    y,
+    angle,
+    speed,
+    damage,
+    source,
+    life = 2,
+    armorDamage = damage
+) {
+    bullets.push({
+        x,
+        y,
+        vx: Math.cos(angle) * speed,
+        vy: Math.sin(angle) * speed,
+        radius: source === "playerScatter" ? 3.5 : 2.4,
+        damage,
+        armorDamage,
+        source,
+        life
+    });
+}
+
+function startReload() {
+    if (player.reloadTimer > 0) {
+        return;
+    }
+
+    if (player.weapon === "rifle") {
+        if (
+            player.rifleMagazine >= CONFIG.rifle.magazine ||
+            player.rifleReserve <= 0
+        ) {
+            return;
+        }
+
+        player.reloadTimer = CONFIG.rifle.reloadTime;
+    } else {
+        if (
+            player.scatterMagazine >= CONFIG.scatter.magazine ||
+            player.scatterReserve <= 0
+        ) {
+            return;
+        }
+
+        player.reloadTimer = CONFIG.scatter.reloadTime;
+    }
+
+    stats.reloads++;
+}
+
+function finishReload() {
+    if (player.weapon === "rifle") {
+        const need = CONFIG.rifle.magazine - player.rifleMagazine;
+        const amount = Math.min(need, player.rifleReserve);
+
+        player.rifleMagazine += amount;
+        player.rifleReserve -= amount;
+    } else {
+        const need = CONFIG.scatter.magazine - player.scatterMagazine;
+        const amount = Math.min(need, player.scatterReserve);
+
+        player.scatterMagazine += amount;
+        player.scatterReserve -= amount;
+    }
+}
+
+function meleeAttack() {
+    if (
+        gameState !== "playing" ||
+        phase().id === "deploy" ||
+        player.meleeCooldown > 0
+    ) {
+        return;
+    }
+
+    player.meleeCooldown = 0.75;
+    stats.meleeUses++;
+
+    for (const enemy of enemies) {
+        if (enemy.dead) continue;
+
+        const d = distance(player.x, player.y, enemy.x, enemy.y);
+        const a = Math.atan2(enemy.y - player.y, enemy.x - player.x);
+
+        if (d <= 56 && Math.abs(angleDiff(a, player.angle)) < 0.85) {
+            const damage = enemy.type === "armored" ? 10 : 38;
+
+            damageEnemy(enemy, damage, "playerMelee", 10);
+
+            if (
+                enemy.type === "grunt" ||
+                enemy.type === "leaper"
+            ) {
+                const dir = normalize(
+                    enemy.x - player.x,
+                    enemy.y - player.y
+                );
+
+                enemy.x += dir.x * 24;
+                enemy.y += dir.y * 24;
+            }
+        }
+    }
+
+    addBurst(
+        player.x + Math.cos(player.angle) * 35,
+        player.y + Math.sin(player.angle) * 35,
+        "#eef8de",
+        6
+    );
+}
+
+function throwGrenade() {
+    if (
+        gameState !== "playing" ||
+        phase().id === "deploy" ||
+        player.grenades <= 0
+    ) {
+        return;
+    }
+
+    player.grenades--;
+    stats.grenadesUsed++;
+
+    const maxDistance = 245;
+    const dx = mouse.x - player.x;
+    const dy = mouse.y - player.y;
+    const d = Math.hypot(dx, dy);
+    const scale = d > maxDistance ? maxDistance / d : 1;
+
+    grenades.push({
+        startX: player.x,
+        startY: player.y,
+        x: player.x,
+        y: player.y,
+        targetX: player.x + dx * scale,
+        targetY: player.y + dy * scale,
+        timer: CONFIG.grenade.fuse,
+        maxTimer: CONFIG.grenade.fuse
+    });
+}
+
+function useMark() {
+    if (
+        gameState !== "playing" ||
+        player.markCooldown > 0 ||
+        phase().id === "deploy"
+    ) {
+        return;
+    }
+
+    let target = null;
+    let best = 75;
+
+    for (const enemy of enemies) {
+        if (enemy.dead) continue;
+
+        const d = distance(mouse.x, mouse.y, enemy.x, enemy.y);
+
+        if (d < best) {
+            best = d;
+            target = enemy;
+        }
+    }
+
+    if (!target) {
+        addNotice("准星附近没有可标记目标", "#d6d6d6", 1.2);
+        return;
+    }
+
+    target.markedTimer = CONFIG.mark.duration;
+    player.markCooldown = CONFIG.mark.cooldown;
+    stats.marksUsed++;
+
+    addNotice("高价值目标已标记：承伤提高", "#ffe46b", 2);
+    logEvent("mark_used", {
+        enemyId: target.id,
+        enemyType: target.type
+    });
+}
+
+function useOverload() {
+    if (
+        gameState !== "playing" ||
+        player.overloadCooldown > 0 ||
+        phase().id === "deploy"
+    ) {
+        return;
+    }
+
+    let affected = 0;
+
+    for (const tower of towers) {
+        if (
+            !tower.mini &&
+            distance(player.x, player.y, tower.x, tower.y) <= 330
+        ) {
+            tower.overloadTimer = CONFIG.overload.duration;
+            affected++;
+        }
+    }
+
+    if (affected === 0) {
+        addNotice("附近没有可过载的大型塔", "#d6d6d6", 1.2);
+        return;
+    }
+
+    player.overloadCooldown = CONFIG.overload.cooldown;
+    stats.overloadsUsed++;
+
+    addNotice("大型塔能量过载：射速和伤害提升", "#72dcff", 2.5);
+    logEvent("overload_used", {
+        affected
+    });
+}
+
+function deployMiniTurret() {
+    if (
+        gameState !== "playing" ||
+        player.miniTurrets <= 0 ||
+        phase().id === "deploy"
+    ) {
+        return;
+    }
+
+    const d = distance(player.x, player.y, mouse.x, mouse.y);
+
+    if (d > 150) {
+        addNotice("微型炮台部署距离过远", "#ffb66d", 1.3);
+        return;
+    }
+
+    player.miniTurrets--;
+    stats.miniTurretsUsed++;
+
+    towers.push({
+        type: "mini",
+        mini: true,
+        x: mouse.x,
+        y: mouse.y,
+        radius: 11,
+        health: 80,
+        maxHealth: 80,
+        angle: player.angle,
+        cooldown: 0,
+        overloadTimer: 0,
+        life: CONFIG.miniTurret.duration
+    });
+
+    addBurst(mouse.x, mouse.y, "#68c9ff", 12);
+    addNotice("微型自动炮台已部署，持续20秒", "#68c9ff", 2);
+}
+
+/* =========================================================
+   10. 伤害与死亡
+   ========================================================= */
+
+function damageEnemy(enemy, damage, source, armorDamage = damage) {
+    if (enemy.dead) {
+        return;
+    }
+
+    const markedMultiplier =
+        enemy.markedTimer > 0
+            ? CONFIG.mark.damageMultiplier
+            : 1;
+
+    damage *= markedMultiplier;
+    armorDamage *= markedMultiplier;
+
+    const playerSource = source.startsWith("player") ||
+                         source === "grenade";
+
+    if (enemy.armor > 0) {
+        let effectiveArmorDamage = armorDamage;
+
+        if (source === "mgTower" || source === "miniTurret") {
+            effectiveArmorDamage *= 0.22;
+        }
+
+        if (source === "sawTower") {
+            effectiveArmorDamage *= 0.12;
+        }
+
+        enemy.armor -= effectiveArmorDamage;
+
+        const bodyLeak = source === "playerScatter" ? 0.28 : 0.08;
+        enemy.health -= damage * bodyLeak;
+
+        if (enemy.armor <= 0) {
+            enemy.armor = 0;
+            enemy.armorBrokenTime = gameTime;
+            stats.armorBreaks++;
+
+            addText(enemy.x, enemy.y - 25, "破甲！", "#d7b6ff", 1.2);
+            addNotice("裂甲已暴露：集中攻击", "#d7b6ff", 1.8);
+        }
+    } else {
+        enemy.health -= damage;
+    }
+
+    if (playerSource) {
+        enemy.playerDamage += damage;
+
+        if (stats.playerDamageByType[enemy.type] !== undefined) {
+            stats.playerDamageByType[enemy.type] += damage;
+        }
+    }
+
+    if (enemy.health <= 0) {
+        killEnemy(enemy, source);
+    }
+}
+
+function killEnemy(enemy, source) {
+    if (enemy.dead) {
+        return;
+    }
+
+    enemy.dead = true;
+
+    addBurst(enemy.x, enemy.y, enemy.color, 11);
+
+    let killCategory = "other";
+
+    if (
+        source === "playerRifle" ||
+        source === "playerScatter" ||
+        source === "playerMelee"
+    ) {
+        killCategory = "player";
+    } else if (source === "mgTower") {
+        killCategory = "mgTower";
+    } else if (source === "sawTower") {
+        killCategory = "sawTower";
+    } else if (source === "miniTurret") {
+        killCategory = "miniTurret";
+    } else if (source === "grenade") {
+        killCategory = "grenade";
+    }
+
+    stats.kills[killCategory]++;
+
+    const typeStats = stats.killsByType[enemy.type];
+
+    if (typeStats) {
+        typeStats.total++;
+
+        if (enemy.type === "grunt") {
+            if (
+                source === "mgTower" ||
+                source === "sawTower" ||
+                source === "miniTurret"
+            ) {
+                typeStats.tower++;
+            } else {
+                typeStats.player++;
+            }
+        } else if (enemy.playerDamage > 0) {
+            typeStats.playerInvolved++;
+        }
+    }
+
+    if (
+        enemy.type === "armored" &&
+        enemy.armorBrokenTime !== null
+    ) {
+        stats.armorKillTimes.push(
+            gameTime - enemy.armorBrokenTime
+        );
+    }
+
+    if (enemy.type === "artillery") {
+        const born = stats.artillerySpawnTimes[enemy.id];
+
+        if (born !== undefined) {
+            stats.artilleryLifeTimes.push(gameTime - born);
+        }
+
+        addNotice(
+            "炮虫已消灭！立即返回中继核心处理缺口",
+            "#79efbd",
+            4
+        );
+
+        logEvent("artillery_killed", {
+            enemyId: enemy.id,
+            lifeTime: Number((gameTime - enemy.spawnTime).toFixed(2))
+        });
+    }
+}
+
+function damageCore(amount, source) {
+    if (gameState !== "playing") {
+        return;
+    }
+
+    core.health -= amount;
+
+    if (stats.coreDamageBySource[source] !== undefined) {
+        stats.coreDamageBySource[source] += amount;
+    }
+
+    screenShake = Math.max(screenShake, 8);
+    addText(core.x, core.y - 45, `-${Math.round(amount)}`, "#ff6a62");
+
+    if (core.health <= CONFIG.core.maxHealth * 0.4 &&
+        core.health + amount > CONFIG.core.maxHealth * 0.4) {
+        addNotice("警告：中继核心生命低于40%", "#ff5454", 4);
+    }
+
+    if (core.health <= 0) {
+        core.health = 0;
+        finishGame(false, "中继核心被摧毁");
+    }
+}
+
+function damagePlayer(amount) {
+    if (
+        gameState !== "playing" ||
+        player.invulnerability > 0
+    ) {
+        return;
+    }
+
+    player.health -= amount;
+    player.invulnerability = 0.18;
+
+    screenShake = Math.max(screenShake, 5);
+    addText(player.x, player.y - 23, `-${Math.round(amount)}`, "#ff887a");
+
+    if (player.health <= 0) {
+        player.health = 0;
+        finishGame(false, "玩家阵亡");
+    }
+}
+
+/* =========================================================
+   11. 更新玩家
+   ========================================================= */
+
+function updatePlayer(dt) {
+    if (gameState !== "playing") {
+        return;
+    }
+
+    player.angle = Math.atan2(
+        mouse.y - player.y,
+        mouse.x - player.x
+    );
+
+    player.fireCooldown -= dt;
+    player.meleeCooldown -= dt;
+    player.markCooldown -= dt;
+    player.overloadCooldown -= dt;
+    player.invulnerability -= dt;
+
+    if (player.reloadTimer > 0) {
+        player.reloadTimer -= dt;
+
+        if (player.reloadTimer <= 0) {
+            finishReload();
+        }
+    }
+
+    let dx = 0;
+    let dy = 0;
+
+    if (keys.has("KeyW")) dy -= 1;
+    if (keys.has("KeyS")) dy += 1;
+    if (keys.has("KeyA")) dx -= 1;
+    if (keys.has("KeyD")) dx += 1;
+
+    const dir = normalize(dx, dy);
+
+    let speed = CONFIG.player.speed;
+
+    if (
+        keys.has("ShiftLeft") ||
+        keys.has("ShiftRight")
+    ) {
+        speed *= CONFIG.player.sprintMultiplier;
+    }
+
+    movePlayer(dir.x * speed * dt, dir.y * speed * dt);
+
+    if (mouse.down && phase().id !== "deploy") {
+        playerShoot();
+    }
+
+    updatePlayerZone(dt);
+    updateSupply(dt);
+}
+
+function movePlayer(dx, dy) {
+    let newX = clamp(player.x + dx, 15, W - 15);
+    let newY = clamp(player.y + dy, 15, H - 15);
+
+    for (const rect of obstacles) {
+        if (!circleRectCollision(newX, player.y, player.radius, rect)) {
+            player.x = newX;
+        }
+
+        if (!circleRectCollision(player.x, newY, player.radius, rect)) {
+            player.y = newY;
+        }
+    }
+}
+
+function updatePlayerZone(dt) {
+    const away = distance(player.x, player.y, core.x, core.y) > 260;
+    const zone = away ? "forward" : "base";
+
+    if (zone !== stats.lastPlayerZone) {
+        stats.playerTransfers++;
+        stats.lastPlayerZone = zone;
+
+        logEvent("player_zone_changed", {
+            zone
+        });
+    }
+
+    if (away) {
+        stats.currentAwayTime += dt;
+        stats.longestAwayTime = Math.max(
+            stats.longestAwayTime,
+            stats.currentAwayTime
+        );
+    } else {
+        stats.currentAwayTime = 0;
+    }
+}
+
+function updateSupply(dt) {
+    supplyPoint.cooldown -= dt;
+
+    if (
+        supplyPoint.cooldown <= 0 &&
+        distance(
+            player.x,
+            player.y,
+            supplyPoint.x,
+            supplyPoint.y
+        ) < 35
+    ) {
+        const rifleNeed =
+            player.rifleReserve < CONFIG.rifle.reserve;
+
+        const scatterNeed =
+            player.scatterReserve < CONFIG.scatter.reserve;
+
+        if (rifleNeed || scatterNeed) {
+            player.rifleReserve = Math.min(
+                CONFIG.rifle.reserve,
+                player.rifleReserve + 72
+            );
+
+            player.scatterReserve = Math.min(
+                CONFIG.scatter.reserve,
+                player.scatterReserve + 8
+            );
+
+            supplyPoint.cooldown = 35;
+            addNotice("补给完成", "#88e5bb", 1.5);
+        }
+    }
+}
+
+/* =========================================================
+   12. 更新塔
+   ========================================================= */
+
+function findTowerTarget(tower, range) {
+    let target = null;
+    let bestScore = Infinity;
+
+    for (const enemy of enemies) {
+        if (enemy.dead) continue;
+
+        const d = distance(tower.x, tower.y, enemy.x, enemy.y);
+
+        if (d > range) continue;
+
+        /*
+            高价值目标略微提高优先级，但距离仍然重要。
+            标记目标拥有最高优先级。
+        */
+        let score = d;
+
+        if (enemy.markedTimer > 0) score -= 220;
+        if (enemy.type === "leaper") score -= 35;
+        if (enemy.type === "armored") score -= 15;
+
+        if (score < bestScore) {
+            bestScore = score;
+            target = enemy;
+        }
+    }
+
+    return target;
+}
+
+function updateTowers(dt) {
+    for (const tower of towers) {
+        tower.cooldown -= dt;
+        tower.overloadTimer -= dt;
+
+        if (tower.mini) {
+            tower.life -= dt;
+
+            if (tower.life <= 0) {
+                tower.health = 0;
+                continue;
+            }
+
+            updateMiniTower(tower);
+            continue;
+        }
+
+        if (tower.type === "mg") {
+            updateMachineGunTower(tower, dt);
+        } else if (tower.type === "saw") {
+            updateSawTower(tower, dt);
+        }
+    }
+
+    towers = towers.filter(t => t.health > 0);
+}
+
+function updateMachineGunTower(tower, dt) {
+    const cfg = CONFIG.machineGunTower;
+    const target = findTowerTarget(tower, cfg.range);
+
+    if (!target) {
+        return;
+    }
+
+    const targetAngle = Math.atan2(
+        target.y - tower.y,
+        target.x - tower.x
+    );
+
+    tower.angle = lerpAngle(
+        tower.angle,
+        targetAngle,
+        cfg.turnSpeed * dt
+    );
+
+    if (
+        Math.abs(angleDiff(targetAngle, tower.angle)) > 0.18 ||
+        tower.cooldown > 0
+    ) {
+        return;
+    }
+
+    const overloaded = tower.overloadTimer > 0;
+
+    const interval = overloaded
+        ? cfg.fireInterval / CONFIG.overload.fireRateMultiplier
+        : cfg.fireInterval;
+
+    const damage = overloaded
+        ? cfg.damage * CONFIG.overload.damageMultiplier
+        : cfg.damage;
+
+    tower.cooldown = interval;
+
+    createBullet(
+        tower.x + Math.cos(tower.angle) * 23,
+        tower.y + Math.sin(tower.angle) * 23,
+        tower.angle,
+        cfg.bulletSpeed,
+        damage,
+        "mgTower",
+        1.1
+    );
+}
+
+function updateSawTower(tower, dt) {
+    const cfg = CONFIG.sawTower;
+    tower.angle += dt * 8;
+
+    for (const enemy of enemies) {
+        if (enemy.dead || enemy.type === "artillery") continue;
+
+        const d = distance(
+            tower.x,
+            tower.y,
+            enemy.x,
+            enemy.y
+        );
+
+        if (d <= cfg.range + enemy.radius) {
+            const damage =
+                enemy.armor > 0
+                    ? cfg.damagePerSecond * cfg.armorMultiplier * dt
+                    : cfg.damagePerSecond * dt;
+
+            damageEnemy(enemy, damage, "sawTower", damage);
+
+            const push = normalize(
+                enemy.x - tower.x,
+                enemy.y - tower.y
+            );
+
+            enemy.x += push.x * cfg.pushStrength * dt;
+            enemy.y += push.y * cfg.pushStrength * dt;
+
+            if (Math.random() < 0.2) {
+                addBurst(enemy.x, enemy.y, "#ffb14d", 2);
+            }
+        }
+    }
+}
+
+function updateMiniTower(tower) {
+    if (tower.cooldown > 0) {
+        return;
+    }
+
+    const target = findTowerTarget(
+        tower,
+        CONFIG.miniTurret.range
+    );
+
+    if (!target) {
+        return;
+    }
+
+    tower.angle = Math.atan2(
+        target.y - tower.y,
+        target.x - tower.x
+    );
+
+    tower.cooldown = CONFIG.miniTurret.fireInterval;
+
+    createBullet(
+        tower.x,
+        tower.y,
+        tower.angle,
+        570,
+        CONFIG.miniTurret.damage,
+        "miniTurret",
+        0.8
+    );
+}
+
+/* =========================================================
+   13. 更新敌人
+   ========================================================= */
+
+function updateEnemies(dt) {
+    for (const enemy of enemies) {
+        if (enemy.dead) continue;
+
+        enemy.markedTimer -= dt;
+        enemy.attackCooldown -= dt;
+
+        if (enemy.type === "artillery") {
+            updateArtillery(enemy, dt);
+            continue;
+        }
+
+        if (enemy.type === "leaper") {
+            updateLeaper(enemy, dt);
+
+            if (enemy.leapState === "warning") {
+                continue;
+            }
+        }
+
+        const playerDistance = distance(
+            enemy.x,
+            enemy.y,
+            player.x,
+            player.y
+        );
+
+        /*
+            玩家离敌人很近时，敌人会短暂攻击玩家；
+            否则继续向中继核心推进。
+        */
+        if (playerDistance < enemy.radius + player.radius + 9) {
+            if (enemy.attackCooldown <= 0) {
+                damagePlayer(
+                    enemy.type === "armored" ? 32 : 11
+                );
+
+                enemy.attackCooldown = enemy.attackInterval;
+            }
+
+            continue;
+        }
+
+        const coreDistance = distance(
+            enemy.x,
+            enemy.y,
+            core.x,
+            core.y
+        );
+
+        if (coreDistance < enemy.radius + core.radius + 4) {
+            if (enemy.attackCooldown <= 0) {
+                damageCore(enemy.damage, enemy.type);
+                enemy.attackCooldown = enemy.attackInterval;
+
+                if (enemy.type === "leaper") {
+                    enemy.dead = true;
+                    addBurst(enemy.x, enemy.y, enemy.color, 8);
+                }
+            }
+
+            continue;
+        }
+
+        moveEnemyAlongPath(enemy, dt);
+    }
+
+    enemies = enemies.filter(e => !e.dead);
+}
+
+function moveEnemyAlongPath(enemy, dt) {
+    let target;
+
+    if (enemy.pathIndex < enemy.path.length) {
+        target = enemy.path[enemy.pathIndex];
+
+        if (
+            distance(enemy.x, enemy.y, target.x, target.y) <
+            enemy.radius + 7
+        ) {
+            enemy.pathIndex++;
+        }
+    }
+
+    if (!target || enemy.pathIndex >= enemy.path.length) {
+        target = core;
+    } else {
+        target = enemy.path[enemy.pathIndex];
+    }
+
+    const dir = normalize(
+        target.x - enemy.x,
+        target.y - enemy.y
+    );
+
+    enemy.x += dir.x * enemy.speed * dt;
+    enemy.y += dir.y * enemy.speed * dt;
+}
+
+function updateLeaper(enemy, dt) {
+    const dToCore = distance(
+        enemy.x,
+        enemy.y,
+        core.x,
+        core.y
+    );
+
+    if (
+        enemy.leapState === "none" &&
+        dToCore < 275
+    ) {
+        enemy.leapState = "warning";
+        enemy.leapTimer = 1.15;
+
+        addNotice("跃袭预警：核心后方！", "#ff9d45", 1.4);
+        logEvent("leaper_warning", {
+            enemyId: enemy.id
+        });
+    }
+
+    if (enemy.leapState === "warning") {
+        enemy.leapTimer -= dt;
+
+        if (enemy.leapTimer <= 0) {
+            enemy.leapState = "landed";
+
+            enemy.x = core.x + randomRange(-95, 95);
+            enemy.y = core.y + randomRange(-25, 45);
+
+            stats.leapersLandedBehind++;
+
+            addBurst(enemy.x, enemy.y, "#ffb347", 14);
+            screenShake = Math.max(screenShake, 5);
+
+            logEvent("leaper_landed", {
+                enemyId: enemy.id
+            });
+        }
+    }
+}
+
+function updateArtillery(enemy, dt) {
+    enemy.artilleryCooldown -= dt;
+
+    /*
+        玩家靠近后炮虫会缓慢转移，以防完全站桩。
+    */
+    const playerDistance = distance(
+        enemy.x,
+        enemy.y,
+        player.x,
+        player.y
+    );
+
+    if (playerDistance < 55) {
+        const away = normalize(
+            enemy.x - player.x,
+            enemy.y - player.y
+        );
+
+        enemy.x = clamp(enemy.x + away.x * 18 * dt, 930, 1105);
+        enemy.y = clamp(enemy.y + away.y * 18 * dt, 85, 245);
+    }
+
+    if (enemy.artilleryCooldown <= 0) {
+        enemy.artilleryCooldown = enemy.attackInterval;
+
+        const targets = [
+            {
+                type: "core",
+                x: core.x,
+                y: core.y
+            }
+        ];
+
+        for (const tower of towers) {
+            if (!tower.mini) {
+                targets.push({
+                    type: "tower",
+                    tower,
+                    x: tower.x,
+                    y: tower.y
+                });
+            }
+        }
+
+        const target =
+            Math.random() < 0.62
+                ? targets[0]
+                : targets[
+                    Math.floor(Math.random() * targets.length)
+                ];
+
+        mortarWarnings.push({
+            x: target.x + randomRange(-18, 18),
+            y: target.y + randomRange(-18, 18),
+            radius: 58,
+            timer: 1.65,
+            maxTimer: 1.65,
+            damage: enemy.damage,
+            sourceEnemyId: enemy.id
+        });
+
+        addNotice("炮击来袭！离开红色落点", "#ff5b62", 1.3);
+    }
+}
+
+/* =========================================================
+   14. 子弹、手雷和炮击
+   ========================================================= */
+
+function updateBullets(dt) {
+    for (const bullet of bullets) {
+        bullet.x += bullet.vx * dt;
+        bullet.y += bullet.vy * dt;
+        bullet.life -= dt;
+
+        if (
+            bullet.x < -20 ||
+            bullet.y < -20 ||
+            bullet.x > W + 20 ||
+            bullet.y > H + 20
+        ) {
+            bullet.life = 0;
+            continue;
+        }
+
+        for (const enemy of enemies) {
+            if (enemy.dead || bullet.life <= 0) continue;
+
+            if (
+                distance(
+                    bullet.x,
+                    bullet.y,
+                    enemy.x,
+                    enemy.y
+                ) <= bullet.radius + enemy.radius
+            ) {
+                damageEnemy(
+                    enemy,
+                    bullet.damage,
+                    bullet.source,
+                    bullet.armorDamage
+                );
+
+                bullet.life = 0;
+                addBurst(bullet.x, bullet.y, "#f1d7a0", 3);
+            }
+        }
+    }
+
+    bullets = bullets.filter(b => b.life > 0);
+}
+
+function updateGrenades(dt) {
+    for (const grenade of grenades) {
+        grenade.timer -= dt;
+
+        const progress =
+            1 - grenade.timer / grenade.maxTimer;
+
+        grenade.x =
+            grenade.startX +
+            (grenade.targetX - grenade.startX) * progress;
+
+        grenade.y =
+            grenade.startY +
+            (grenade.targetY - grenade.startY) * progress -
+            Math.sin(progress * Math.PI) * 35;
+
+        if (grenade.timer <= 0) {
+            createExplosion(
+                grenade.targetX,
+                grenade.targetY,
+                CONFIG.grenade.radius,
+                CONFIG.grenade.damage,
+                "grenade",
+                CONFIG.grenade.armorDamage
+            );
+        }
+    }
+
+    grenades = grenades.filter(g => g.timer > 0);
+}
+
+function createExplosion(
+    x,
+    y,
+    radius,
+    damage,
+    source,
+    armorDamage = damage
+) {
+    explosions.push({
+        x,
+        y,
+        radius: 4,
+        maxRadius: radius,
+        life: 0.35,
+        maxLife: 0.35,
+        color: source === "artillery"
+            ? "#ff5966"
+            : "#ffba4b"
+    });
+
+    addBurst(x, y, "#ffb84d", 24);
+    screenShake = Math.max(screenShake, 10);
+
+    if (source === "grenade") {
+        for (const enemy of enemies) {
+            if (enemy.dead) continue;
+
+            const d = distance(x, y, enemy.x, enemy.y);
+
+            if (d <= radius + enemy.radius) {
+                const falloff = 1 - clamp(d / radius, 0, 0.75);
+
+                damageEnemy(
+                    enemy,
+                    damage * falloff,
+                    "grenade",
+                    armorDamage * falloff
+                );
+            }
+        }
+    }
+}
+
+function updateMortars(dt) {
+    for (const mortar of mortarWarnings) {
+        mortar.timer -= dt;
+
+        if (mortar.timer <= 0) {
+            createExplosion(
+                mortar.x,
+                mortar.y,
+                mortar.radius,
+                mortar.damage,
+                "artillery"
+            );
+
+            if (
+                distance(
+                    mortar.x,
+                    mortar.y,
+                    core.x,
+                    core.y
+                ) <= mortar.radius + core.radius
+            ) {
+                damageCore(mortar.damage, "artillery");
+            }
+
+            if (
+                distance(
+                    mortar.x,
+                    mortar.y,
+                    player.x,
+                    player.y
+                ) <= mortar.radius + player.radius
+            ) {
+                damagePlayer(55);
+            }
+
+            for (const tower of towers) {
+                if (
+                    distance(
+                        mortar.x,
+                        mortar.y,
+                        tower.x,
+                        tower.y
+                    ) <= mortar.radius + tower.radius
+                ) {
+                    tower.health -= 95;
+
+                    if (tower.health <= 0) {
+                        addNotice("一座防御塔被炮击摧毁", "#ff6161", 3);
+                    }
+                }
+            }
+        }
+    }
+
+    mortarWarnings = mortarWarnings.filter(m => m.timer > 0);
+}
+
+function updateEffects(dt) {
+    for (const explosion of explosions) {
+        explosion.life -= dt;
+
+        const progress =
+            1 - explosion.life / explosion.maxLife;
+
+        explosion.radius =
+            explosion.maxRadius * Math.sin(progress * Math.PI * 0.7);
+    }
+
+    explosions = explosions.filter(e => e.life > 0);
+
+    for (const particle of particles) {
+        particle.life -= dt;
+        particle.x += particle.vx * dt;
+        particle.y += particle.vy * dt;
+        particle.vx *= Math.pow(0.05, dt);
+        particle.vy *= Math.pow(0.05, dt);
+    }
+
+    particles = particles.filter(p => p.life > 0);
+
+    for (const text of floatingTexts) {
+        text.life -= dt;
+        text.y -= 26 * dt;
+    }
+
+    floatingTexts = floatingTexts.filter(t => t.life > 0);
+
+    for (const notice of notices) {
+        notice.life -= dt;
+    }
+
+    notices = notices.filter(n => n.life > 0);
+
+    screenShake = Math.max(0, screenShake - 25 * dt);
+}
+
+/* =========================================================
+   15. 结束、报告与日志
+   ========================================================= */
+
+function finishGame(victory, reason = "") {
+    if (gameState !== "playing") {
+        return;
+    }
+
+    gameState = victory ? "victory" : "defeat";
+
+    stats.playTime = gameTime;
+    stats.result = gameState;
+    stats.failureReason = reason;
+    stats.endedAt = new Date().toISOString();
+
+    logEvent(victory ? "prototype_completed" : "prototype_failed", {
+        reason
+    });
+}
+
+function buildReport() {
+    const grunt = stats.killsByType.grunt;
+    const specialTypes = ["leaper", "armored", "artillery"];
+
+    const specialTotal = specialTypes.reduce(
+        (sum, type) => sum + stats.killsByType[type].total,
+        0
+    );
+
+    const specialInvolved = specialTypes.reduce(
+        (sum, type) =>
+            sum + stats.killsByType[type].playerInvolved,
+        0
+    );
+
+    const towerGruntRate = grunt.total > 0
+        ? grunt.tower / grunt.total * 100
+        : 0;
+
+    const playerSpecialRate = specialTotal > 0
+        ? specialInvolved / specialTotal * 100
+        : 0;
+
+    const artilleryAverage =
+        stats.artilleryLifeTimes.length > 0
+            ? stats.artilleryLifeTimes.reduce((a, b) => a + b, 0) /
+              stats.artilleryLifeTimes.length
+            : 0;
+
+    let conclusion;
+    let conclusionColor;
+
+    if (
+        towerGruntRate >= 55 &&
+        towerGruntRate <= 85 &&
+        playerSpecialRate >= 65
+    ) {
+        conclusion = "通过：玩家与塔的基础职责关系成立";
+        conclusionColor = "#79efbd";
+    } else if (
+        towerGruntRate >= 40 &&
+        playerSpecialRate >= 45
+    ) {
+        conclusion = "部分通过：循环成立，但职责或参数仍需调整";
+        conclusionColor = "#ffd66e";
+    } else {
+        conclusion = "未通过：玩家与塔的职责分工不够明确";
+        conclusionColor = "#ff7b71";
+    }
+
+    return {
+        towerGruntRate,
+        playerSpecialRate,
+        artilleryAverage,
+        conclusion,
+        conclusionColor
+    };
+}
+
+function exportLog() {
+    const report = buildReport();
+
+    const payload = {
+        prototype: "CP-01 峡口中继站",
+        version: "Web Graybox 1.0",
+        report,
+        stats
+    };
+
+    const blob = new Blob(
+        [JSON.stringify(payload, null, 2)],
+        { type: "application/json" }
+    );
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+
+    a.href = url;
+    a.download =
+        `CP01-test-log-${new Date()
+            .toISOString()
+            .replace(/[:.]/g, "-")}.json`;
+
+    a.click();
+
+    URL.revokeObjectURL(url);
+}
+
+/* =========================================================
+   16. 主更新
+   ========================================================= */
+
+function update(dt) {
+    if (gameState === "playing") {
+        gameTime += dt;
+
+        updatePlayer(dt);
+        updatePhase(dt);
+        updateTowers(dt);
+        updateEnemies(dt);
+        updateBullets(dt);
+        updateGrenades(dt);
+        updateMortars(dt);
+
+        stats.playTime = gameTime;
+
+        if (phase().id === "deploy") {
+            stats.deploymentTime = gameTime;
+        }
+    }
+
+    updateEffects(dt);
+}
+
+/* =========================================================
+   17. 地图绘制
+   ========================================================= */
+
+function drawMap() {
+    ctx.fillStyle = "#12191b";
+    ctx.fillRect(0, 0, W, H);
+
+    // 网格
+    ctx.strokeStyle = "rgba(110,160,150,0.055)";
+    ctx.lineWidth = 1;
+
+    for (let x = 0; x <= W; x += 40) {
+        ctx.beginPath();
+        ctx.moveTo(x, 0);
+        ctx.lineTo(x, H);
+        ctx.stroke();
+    }
+
+    for (let y = 0; y <= H; y += 40) {
+        ctx.beginPath();
+        ctx.moveTo(0, y);
+        ctx.lineTo(W, y);
+        ctx.stroke();
+    }
+
+    // 正面开阔路线 A
+    ctx.fillStyle = "#283126";
+    ctx.fillRect(445, 20, 290, 610);
+
+    ctx.strokeStyle = "rgba(133,184,117,0.35)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(445, 20, 290, 610);
+
+    // 侧路 B
+    ctx.strokeStyle = "#303c30";
+    ctx.lineWidth = 74;
+    ctx.lineCap = "round";
+    ctx.lineJoin = "round";
+
+    ctx.beginPath();
+    ctx.moveTo(70, 430);
+    ctx.lineTo(285, 430);
+    ctx.lineTo(285, 625);
+    ctx.lineTo(475, 660);
+    ctx.stroke();
+
+    ctx.strokeStyle = "rgba(133,184,117,0.35)";
+    ctx.lineWidth = 2;
+
+    ctx.beginPath();
+    ctx.moveTo(70, 390);
+    ctx.lineTo(325, 390);
+    ctx.lineTo(325, 590);
+    ctx.lineTo(485, 620);
+    ctx.stroke();
+
+    // 炮虫前出路线 C
+    ctx.strokeStyle = "rgba(79,113,104,0.26)";
+    ctx.lineWidth = 48;
+
+    ctx.beginPath();
+    ctx.moveTo(650, 675);
+    ctx.lineTo(745, 570);
+    ctx.lineTo(830, 445);
+    ctx.lineTo(900, 315);
+    ctx.lineTo(1025, 165);
+    ctx.stroke();
+
+    // 基地平台 D
+    ctx.fillStyle = "#26353a";
+    ctx.fillRect(420, 620, 340, 180);
+
+    ctx.strokeStyle = "#4a6970";
+    ctx.lineWidth = 3;
+    ctx.strokeRect(420, 620, 340, 180);
+
+    // 炮虫高地
+    ctx.fillStyle = "#352b38";
+    ctx.beginPath();
+    ctx.arc(
+        highland.x,
+        highland.y,
+        highland.radius,
+        0,
+        TAU
+    );
+    ctx.fill();
+
+    ctx.strokeStyle = "#8f678f";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    // 障碍物
+    for (const rect of obstacles) {
+        ctx.fillStyle = "#46504d";
+        ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+
+        ctx.strokeStyle = "#66736f";
+        ctx.lineWidth = 2;
+        ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    }
+
+    // 区域标签
+    ctx.font = "13px Microsoft YaHei";
+    ctx.textAlign = "center";
+
+    ctx.fillStyle = "rgba(210,235,220,0.65)";
+    ctx.fillText("A 正面开阔路线", 590, 36);
+    ctx.fillText("B 狭窄侧路", 190, 376);
+    ctx.fillText("C 前出路线", 865, 430);
+    ctx.fillText("P1 炮虫高地", highland.x, 70);
+    ctx.fillText("D 基地防守平台", 590, 646);
+
+    drawDeploymentPads();
+    drawSupply();
+}
+
+function drawDeploymentPads() {
+    for (const pad of deploymentPads) {
+        const hover =
+            distance(mouse.x, mouse.y, pad.x, pad.y) <
+            pad.radius + 20;
+
+        ctx.fillStyle = pad.tower
+            ? "rgba(84,145,126,0.18)"
+            : hover
+                ? "rgba(110,235,185,0.22)"
+                : "rgba(110,235,185,0.1)";
+
+        ctx.beginPath();
+        ctx.arc(pad.x, pad.y, pad.radius, 0, TAU);
+        ctx.fill();
+
+        ctx.strokeStyle = pad.tower
+            ? "rgba(100,190,155,0.45)"
+            : "#68d5ac";
+
+        ctx.lineWidth = 2;
+        ctx.setLineDash([7, 5]);
+
+        ctx.beginPath();
+        ctx.arc(pad.x, pad.y, pad.radius, 0, TAU);
+        ctx.stroke();
+
+        ctx.setLineDash([]);
+
+        ctx.fillStyle = "rgba(220,250,238,0.8)";
+        ctx.font = "12px Microsoft YaHei";
+        ctx.textAlign = "center";
+        ctx.fillText(
+            `${pad.id} ${pad.label}`,
+            pad.x,
+            pad.y + pad.radius + 17
+        );
+    }
+}
+
+function drawSupply() {
+    const ready = supplyPoint.cooldown <= 0;
+
+    ctx.fillStyle = ready
+        ? "#73ddb2"
+        : "#465b54";
+
+    ctx.fillRect(
+        supplyPoint.x - 15,
+        supplyPoint.y - 15,
+        30,
+        30
+    );
+
+    ctx.strokeStyle = "#c2f4df";
+    ctx.strokeRect(
+        supplyPoint.x - 15,
+        supplyPoint.y - 15,
+        30,
+        30
+    );
+
+    ctx.fillStyle = "#d8f4e8";
+    ctx.font = "11px Microsoft YaHei";
+    ctx.textAlign = "center";
+    ctx.fillText(
+        ready
+            ? "补给"
+            : Math.ceil(supplyPoint.cooldown) + "s",
+        supplyPoint.x,
+        supplyPoint.y + 4
+    );
+}
+
+/* =========================================================
+   18. 实体绘制
+   ========================================================= */
+
+function drawCore() {
+    const ratio = core.health / core.maxHealth;
+
+    ctx.save();
+    ctx.translate(core.x, core.y);
+
+    ctx.fillStyle =
+        ratio < 0.4
+            ? "#b84d4d"
+            : "#4fa89c";
+
+    ctx.beginPath();
+    ctx.arc(0, 0, core.radius, 0, TAU);
+    ctx.fill();
+
+    ctx.strokeStyle = "#bff5e8";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    ctx.rotate(gameTime * 0.5);
+    ctx.strokeStyle = "rgba(175,255,235,0.65)";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(-22, -22, 44, 44);
+
+    ctx.restore();
+
+    drawBar(
+        core.x - 55,
+        core.y - 54,
+        110,
+        8,
+        core.health,
+        core.maxHealth,
+        ratio < 0.4 ? "#ff5b5b" : "#60d7b4"
+    );
+
+    ctx.fillStyle = "#defaf0";
+    ctx.font = "12px Microsoft YaHei";
+    ctx.textAlign = "center";
+    ctx.fillText(
+        `OBJ ${Math.ceil(core.health)}/${core.maxHealth}`,
+        core.x,
+        core.y - 62
+    );
+}
+
+function drawPlayer() {
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    ctx.rotate(player.angle);
+
+    ctx.fillStyle =
+        player.invulnerability > 0
+            ? "#ffffff"
+            : "#65c7ff";
+
+    ctx.beginPath();
+    ctx.arc(0, 0, player.radius, 0, TAU);
+    ctx.fill();
+
+    ctx.fillStyle =
+        player.weapon === "rifle"
+            ? "#d8eef7"
+            : "#d6b7ff";
+
+    ctx.fillRect(5, -4, 23, 8);
+
+    ctx.restore();
+
+    drawBar(
+        player.x - 20,
+        player.y - 25,
+        40,
+        5,
+        player.health,
+        player.maxHealth,
+        "#63d9c1"
+    );
+
+    if (player.reloadTimer > 0) {
+        ctx.fillStyle = "#f3e29b";
+        ctx.font = "11px Microsoft YaHei";
+        ctx.textAlign = "center";
+        ctx.fillText("换弹中", player.x, player.y - 31);
+    }
+}
+
+function drawTowers() {
+    for (const tower of towers) {
+        if (tower.type === "mg") {
+            drawMachineGunTower(tower);
+        } else if (tower.type === "saw") {
+            drawSawTower(tower);
+        } else {
+            drawMiniTurret(tower);
+        }
+    }
+}
+
+function drawMachineGunTower(tower) {
+    const overloaded = tower.overloadTimer > 0;
+
+    ctx.save();
+    ctx.translate(tower.x, tower.y);
+
+    ctx.fillStyle = overloaded ? "#62ddff" : "#5d9dad";
+    ctx.beginPath();
+    ctx.arc(0, 0, tower.radius, 0, TAU);
+    ctx.fill();
+
+    ctx.strokeStyle = overloaded ? "#d8faff" : "#b3dce3";
+    ctx.lineWidth = 3;
+    ctx.stroke();
+
+    ctx.rotate(tower.angle);
+    ctx.fillStyle = "#d6edf0";
+    ctx.fillRect(0, -4, 29, 8);
+
+    ctx.restore();
+
+    drawBar(
+        tower.x - 25,
+        tower.y - 33,
+        50,
+        5,
+        tower.health,
+        tower.maxHealth,
+        "#62c9dd"
+    );
+}
+
+function drawSawTower(tower) {
+    ctx.save();
+    ctx.translate(tower.x, tower.y);
+    ctx.rotate(tower.angle);
+
+    ctx.fillStyle =
+        tower.overloadTimer > 0
+            ? "#6be0ff"
+            : "#cc7c42";
+
+    ctx.beginPath();
+    ctx.arc(0, 0, tower.radius, 0, TAU);
+    ctx.fill();
+
+    ctx.strokeStyle = "#ffd09a";
+    ctx.lineWidth = 3;
+
+    for (let i = 0; i < 8; i++) {
+        ctx.rotate(TAU / 8);
+        ctx.beginPath();
+        ctx.moveTo(tower.radius - 4, 0);
+        ctx.lineTo(tower.radius + 13, 0);
+        ctx.stroke();
+    }
+
+    ctx.restore();
+
+    drawBar(
+        tower.x - 25,
+        tower.y - 38,
+        50,
+        5,
+        tower.health,
+        tower.maxHealth,
+        "#efaa61"
+    );
+}
+
+function drawMiniTurret(tower) {
+    ctx.save();
+    ctx.translate(tower.x, tower.y);
+    ctx.rotate(tower.angle);
+
+    ctx.fillStyle = "#5bb6e5";
+    ctx.fillRect(-9, -9, 18, 18);
+
+    ctx.fillStyle = "#c9eeff";
+    ctx.fillRect(0, -2, 17, 4);
+
+    ctx.restore();
+
+    ctx.fillStyle = "#9bdfff";
+    ctx.font = "10px Microsoft YaHei";
+    ctx.textAlign = "center";
+    ctx.fillText(
+        Math.ceil(tower.life) + "s",
+        tower.x,
+        tower.y - 16
+    );
+}
+
+function drawEnemies() {
+    for (const enemy of enemies) {
+        if (enemy.dead) continue;
+
+        ctx.save();
+        ctx.translate(enemy.x, enemy.y);
+
+        if (enemy.type === "grunt") {
+            ctx.fillStyle = enemy.color;
+            ctx.beginPath();
+            ctx.arc(0, 0, enemy.radius, 0, TAU);
+            ctx.fill();
+
+            ctx.fillStyle = "#6f241e";
+            ctx.fillRect(-13, -3, 26, 6);
+        }
+
+        if (enemy.type === "leaper") {
+            ctx.rotate(gameTime * 3);
+
+            ctx.fillStyle = enemy.color;
+            ctx.beginPath();
+            ctx.moveTo(0, -enemy.radius - 4);
+            ctx.lineTo(enemy.radius + 5, enemy.radius);
+            ctx.lineTo(-enemy.radius - 5, enemy.radius);
+            ctx.closePath();
+            ctx.fill();
+
+            if (enemy.leapState === "warning") {
+                const pulse =
+                    20 + Math.sin(gameTime * 14) * 5;
+
+                ctx.strokeStyle = "#ffcb65";
+                ctx.lineWidth = 3;
+                ctx.beginPath();
+                ctx.arc(0, 0, pulse, 0, TAU);
+                ctx.stroke();
+            }
+        }
+
+        if (enemy.type === "armored") {
+            ctx.fillStyle = enemy.color;
+            ctx.fillRect(
+                -enemy.radius,
+                -enemy.radius,
+                enemy.radius * 2,
+                enemy.radius * 2
+            );
+
+            if (enemy.armor > 0) {
+                ctx.strokeStyle = "#d2b8ff";
+                ctx.lineWidth = 5;
+                ctx.strokeRect(
+                    -enemy.radius - 3,
+                    -enemy.radius - 3,
+                    enemy.radius * 2 + 6,
+                    enemy.radius * 2 + 6
+                );
+            }
+        }
+
+        if (enemy.type === "artillery") {
+            ctx.fillStyle = enemy.color;
+            ctx.beginPath();
+
+            for (let i = 0; i < 8; i++) {
+                const a = i / 8 * TAU;
+                const r = i % 2 === 0
+                    ? enemy.radius + 9
+                    : enemy.radius;
+
+                const px = Math.cos(a) * r;
+                const py = Math.sin(a) * r;
+
+                if (i === 0) {
+                    ctx.moveTo(px, py);
+                } else {
+                    ctx.lineTo(px, py);
+                }
+            }
+
+            ctx.closePath();
+            ctx.fill();
+
+            ctx.fillStyle = "#f0afd5";
+            ctx.fillRect(-5, 0, 10, 32);
+        }
+
+        if (enemy.markedTimer > 0) {
+            ctx.strokeStyle = "#ffe14d";
+            ctx.lineWidth = 3;
+            ctx.beginPath();
+            ctx.arc(0, 0, enemy.radius + 9, 0, TAU);
+            ctx.stroke();
+
+            ctx.fillStyle = "#ffe14d";
+            ctx.font = "bold 15px Arial";
+            ctx.textAlign = "center";
+            ctx.fillText("▼", 0, -enemy.radius - 13);
+        }
+
+        ctx.restore();
+
+        drawBar(
+            enemy.x - 20,
+            enemy.y - enemy.radius - 16,
+            40,
+            4,
+            enemy.health,
+            enemy.maxHealth,
+            "#e96555"
+        );
+
+        if (enemy.maxArmor > 0 && enemy.armor > 0) {
+            drawBar(
+                enemy.x - 20,
+                enemy.y - enemy.radius - 10,
+                40,
+                3,
+                enemy.armor,
+                enemy.maxArmor,
+                "#aa89e5"
+            );
+        }
+    }
+}
+
+function drawProjectiles() {
+    for (const bullet of bullets) {
+        ctx.fillStyle =
+            bullet.source === "mgTower"
+                ? "#80edff"
+                : bullet.source === "miniTurret"
+                    ? "#6bc5ff"
+                    : bullet.source === "playerScatter"
+                        ? "#d9b3ff"
+                        : "#f7efb0";
+
+        ctx.beginPath();
+        ctx.arc(
+            bullet.x,
+            bullet.y,
+            bullet.radius,
+            0,
+            TAU
+        );
+        ctx.fill();
+    }
+
+    for (const grenade of grenades) {
+        ctx.fillStyle = "#9de176";
+        ctx.beginPath();
+        ctx.arc(grenade.x, grenade.y, 7, 0, TAU);
+        ctx.fill();
+    }
+
+    for (const mortar of mortarWarnings) {
+        const ratio = mortar.timer / mortar.maxTimer;
+        const pulse = 0.45 + Math.sin(gameTime * 18) * 0.2;
+
+        ctx.fillStyle = `rgba(255,45,55,${pulse * (1 - ratio * 0.4)})`;
+        ctx.beginPath();
+        ctx.arc(
+            mortar.x,
+            mortar.y,
+            mortar.radius,
+            0,
+            TAU
+        );
+        ctx.fill();
+
+        ctx.strokeStyle = "#ffb0a7";
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        ctx.arc(
+            mortar.x,
+            mortar.y,
+            mortar.radius * ratio,
+            0,
+            TAU
+        );
+        ctx.stroke();
+    }
+
+    for (const explosion of explosions) {
+        ctx.fillStyle =
+            explosion.color === "#ff5966"
+                ? "rgba(255,70,85,0.35)"
+                : "rgba(255,180,55,0.38)";
+
+        ctx.beginPath();
+        ctx.arc(
+            explosion.x,
+            explosion.y,
+            explosion.radius,
+            0,
+            TAU
+        );
+        ctx.fill();
+    }
+
+    for (const particle of particles) {
+        ctx.globalAlpha = clamp(
+            particle.life / particle.maxLife,
+            0,
+            1
+        );
+
+        ctx.fillStyle = particle.color;
+        ctx.beginPath();
+        ctx.arc(
+            particle.x,
+            particle.y,
+            particle.radius,
+            0,
+            TAU
+        );
+        ctx.fill();
+    }
+
+    ctx.globalAlpha = 1;
+
+    for (const text of floatingTexts) {
+        ctx.globalAlpha = clamp(
+            text.life / text.maxLife,
+            0,
+            1
+        );
+
+        ctx.fillStyle = text.color;
+        ctx.font = "bold 14px Microsoft YaHei";
+        ctx.textAlign = "center";
+        ctx.fillText(text.text, text.x, text.y);
+    }
+
+    ctx.globalAlpha = 1;
+}
+
+/* =========================================================
+   19. HUD
+   ========================================================= */
+
+function drawHUD() {
+    drawTopHUD();
+    drawPlayerHUD();
+    drawThreatHUD();
+    drawNotices();
+
+    if (phase().id === "deploy") {
+        drawDeploymentHUD();
+    }
+
+    if (gameState !== "playing") {
+        drawEndScreen();
+    }
+}
+
+function drawTopHUD() {
+    ctx.fillStyle = "rgba(4,8,10,0.84)";
+    ctx.fillRect(250, 10, 700, 75);
+
+    ctx.strokeStyle = "rgba(104,213,172,0.3)";
+    ctx.strokeRect(250, 10, 700, 75);
+
+    ctx.fillStyle = "#8de9c6";
+    ctx.font = "bold 18px Microsoft YaHei";
+    ctx.textAlign = "center";
+    ctx.fillText(phase().name, 600, 34);
+
+    ctx.fillStyle = "#dbeee7";
+    ctx.font = "13px Microsoft YaHei";
+    ctx.fillText(phase().objective, 600, 57);
+
+    if (phase().duration !== Infinity) {
+        const remaining = phase().duration - phaseTime;
+
+        ctx.fillStyle = "#f2e7ae";
+        ctx.fillText(
+            `阶段时间 ${formatTime(remaining)}　时间倍率 ×${timeScale}`,
+            600,
+            77
+        );
+    }
+}
+
+function drawPlayerHUD() {
+    ctx.fillStyle = "rgba(4,8,10,0.84)";
+    ctx.fillRect(12, 12, 220, 158);
+
+    ctx.strokeStyle = "rgba(104,213,172,0.3)";
+    ctx.strokeRect(12, 12, 220, 158);
+
+    ctx.fillStyle = "#dff7ee";
+    ctx.font = "13px Microsoft YaHei";
+    ctx.textAlign = "left";
+
+    ctx.fillText(
+        `玩家生命：${Math.ceil(player.health)}/${player.maxHealth}`,
+        25,
+        34
+    );
+
+    drawBar(
+        25,
+        42,
+        190,
+        9,
+        player.health,
+        player.maxHealth,
+        "#61d5b5"
+    );
+
+    const weaponName =
+        player.weapon === "rifle"
+            ? "突击步枪"
+            : "破甲散射炮";
+
+    const ammo =
+        player.weapon === "rifle"
+            ? `${player.rifleMagazine}/${player.rifleReserve}`
+            : `${player.scatterMagazine}/${player.scatterReserve}`;
+
+    ctx.fillText(`武器：${weaponName}`, 25, 72);
+    ctx.fillText(`弹药：${ammo}`, 25, 94);
+    ctx.fillText(`高爆雷：${player.grenades}`, 25, 116);
+    ctx.fillText(`微型炮台：${player.miniTurrets}`, 25, 138);
+
+    ctx.fillStyle = "#b9ccc6";
+    ctx.fillText(
+        player.reloadTimer > 0
+            ? `换弹：${player.reloadTimer.toFixed(1)}秒`
+            : "武器就绪",
+        25,
+        159
+    );
+}
+
+function drawThreatHUD() {
+    ctx.fillStyle = "rgba(4,8,10,0.84)";
+    ctx.fillRect(968, 12, 220, 158);
+
+    ctx.strokeStyle = "rgba(104,213,172,0.3)";
+    ctx.strokeRect(968, 12, 220, 158);
+
+    ctx.textAlign = "left";
+    ctx.font = "13px Microsoft YaHei";
+    ctx.fillStyle = "#dff7ee";
+
+    ctx.fillText("战术状态", 982, 34);
+
+    const artilleryAlive = enemies.some(e =>
+        e.type === "artillery" && !e.dead
+    );
+
+    const leapers = enemies.filter(e =>
+        e.type === "leaper" && !e.dead
+    ).length;
+
+    const armored = enemies.filter(e =>
+        e.type === "armored" && !e.dead
+    ).length;
+
+    ctx.fillStyle = artilleryAlive ? "#ff646a" : "#81948e";
+    ctx.fillText(
+        artilleryAlive
+            ? "● 炮虫正在远程轰击"
+            : "○ 未侦测到炮虫",
+        982,
+        58
+    );
+
+    ctx.fillStyle = leapers > 0 ? "#ffad4f" : "#81948e";
+    ctx.fillText(`跃袭虫：${leapers}`, 982, 80);
+
+    ctx.fillStyle = armored > 0 ? "#bea1ff" : "#81948e";
+    ctx.fillText(`裂甲虫：${armored}`, 982, 102);
+
+    ctx.fillStyle =
+        player.markCooldown <= 0
+            ? "#ffe77b"
+            : "#81948e";
+
+    ctx.fillText(
+        `Z 标记：${
+            player.markCooldown <= 0
+                ? "就绪"
+                : Math.ceil(player.markCooldown) + "s"
+        }`,
+        982,
+        126
+    );
+
+    ctx.fillStyle =
+        player.overloadCooldown <= 0
+            ? "#79dfff"
+            : "#81948e";
+
+    ctx.fillText(
+        `X 过载：${
+            player.overloadCooldown <= 0
+                ? "就绪"
+                : Math.ceil(player.overloadCooldown) + "s"
+        }`,
+        982,
+        150
+    );
+}
+
+function drawNotices() {
+    const visible = notices.slice(-3);
+
+    for (let i = 0; i < visible.length; i++) {
+        const notice = visible[visible.length - 1 - i];
+
+        ctx.globalAlpha = clamp(
+            notice.life / Math.min(notice.maxLife, 0.5),
+            0,
+            1
+        );
+
+        ctx.fillStyle = "rgba(0,0,0,0.72)";
+        ctx.fillRect(
+            330,
+            100 + i * 34,
+            540,
+            28
+        );
+
+        ctx.fillStyle = notice.color;
+        ctx.font = "bold 14px Microsoft YaHei";
+        ctx.textAlign = "center";
+
+        ctx.fillText(
+            notice.text,
+            600,
+            120 + i * 34
+        );
+    }
+
+    ctx.globalAlpha = 1;
+}
+
+function drawDeploymentHUD() {
+    ctx.fillStyle = "rgba(4,8,10,0.9)";
+    ctx.fillRect(375, 655, 450, 120);
+
+    ctx.strokeStyle = "#68d5ac";
+    ctx.lineWidth = 2;
+    ctx.strokeRect(375, 655, 450, 120);
+
+    ctx.textAlign = "center";
+    ctx.fillStyle = "#e3f8ef";
+    ctx.font = "bold 16px Microsoft YaHei";
+
+    ctx.fillText(
+        "大型塔部署阶段",
+        600,
+        681
+    );
+
+    ctx.font = "13px Microsoft YaHei";
+    ctx.fillStyle = "#cbded8";
+
+    ctx.fillText(
+        "Q：选择重机枪塔　E：选择链锯塔　左键：部署",
+        600,
+        707
+    );
+
+    ctx.fillStyle =
+        selectedTowerType === "mg"
+            ? "#71def5"
+            : "#f0aa65";
+
+    ctx.fillText(
+        selectedTowerType === "mg"
+            ? "当前选择：重机枪塔"
+            : "当前选择：链锯拒止塔",
+        600,
+        732
+    );
+
+    ctx.fillStyle = "#ffe490";
+    ctx.fillText(
+        "部署完成后按 Enter 开始防守",
+        600,
+        757
+    );
+}
+
+function drawEndScreen() {
+    const report = buildReport();
+
+    ctx.fillStyle = "rgba(0,0,0,0.84)";
+    ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle =
+        gameState === "victory"
+            ? "#7ce8bd"
+            : "#ff766e";
+
+    ctx.font = "bold 34px Microsoft YaHei";
+    ctx.textAlign = "center";
+
+    ctx.fillText(
+        gameState === "victory"
+            ? "原型防守完成"
+            : "原型测试失败",
+        W / 2,
+        90
+    );
+
+    ctx.fillStyle = report.conclusionColor;
+    ctx.font = "bold 20px Microsoft YaHei";
+    ctx.fillText(report.conclusion, W / 2, 128);
+
+    const lines = [
+        `普通工蚁虫由塔击杀：${report.towerGruntRate.toFixed(1)}%　目标：60%～80%`,
+        `特殊敌人由玩家参与处理：${report.playerSpecialRate.toFixed(1)}%　目标：70%以上`,
+        `部署完成时间：${stats.deploymentTime.toFixed(1)}秒　目标：单座3～5秒以内`,
+        `玩家最长离开基地：${stats.longestAwayTime.toFixed(1)}秒　目标：15～25秒`,
+        `炮虫平均存活：${report.artilleryAverage.toFixed(1)}秒　目标：15～30秒`,
+        `跃袭虫落入后方：${stats.leapersLandedBehind}/${stats.leapersSpawned}`,
+        `裂甲次数：${stats.armorBreaks}`,
+        `目标标记使用：${stats.marksUsed}次`,
+        `能量过载使用：${stats.overloadsUsed}次`,
+        `玩家主动转移：${stats.playerTransfers}次`,
+        "",
+        `核心受损来源：工蚁 ${Math.round(stats.coreDamageBySource.grunt)} / 跃袭 ${Math.round(stats.coreDamageBySource.leaper)} / 裂甲 ${Math.round(stats.coreDamageBySource.armored)} / 炮击 ${Math.round(stats.coreDamageBySource.artillery)}`,
+        "",
+        "按 N 重新开始　按 L 导出完整 JSON 测试日志"
+    ];
+
+    ctx.font = "15px Microsoft YaHei";
+    ctx.fillStyle = "#dcece6";
+
+    let y = 175;
+
+    for (const line of lines) {
+        ctx.fillText(line, W / 2, y);
+        y += 31;
+    }
+
+    ctx.fillStyle = "#9fb3ad";
+    ctx.font = "13px Microsoft YaHei";
+
+    ctx.fillText(
+        "测试问题：哪些敌人应该交给塔？哪些敌人必须亲自处理？炮虫出现时是否愿意离开基地？",
+        W / 2,
+        650
+    );
+}
+
+/* =========================================================
+   20. 总绘制
+   ========================================================= */
+
+function draw() {
+    ctx.save();
+
+    if (screenShake > 0) {
+        ctx.translate(
+            randomRange(-screenShake, screenShake),
+            randomRange(-screenShake, screenShake)
+        );
+    }
+
+    drawMap();
+    drawCore();
+    drawTowers();
+    drawEnemies();
+    drawPlayer();
+    drawProjectiles();
+
+    ctx.restore();
+
+    // HUD不参与镜头震动
+    drawHUD();
+}
+
+/* =========================================================
+   21. 输入
+   ========================================================= */
+
+window.addEventListener("keydown", event => {
+    keys.add(event.code);
+
+    if (
+        event.code === "Space" ||
+        event.code.startsWith("Arrow")
+    ) {
+        event.preventDefault();
+    }
+
+    if (event.repeat) {
+        return;
+    }
+
+    if (event.code === "Digit1") {
+        player.weapon = "rifle";
+        player.reloadTimer = 0;
+    }
+
+    if (event.code === "Digit2") {
+        player.weapon = "scatter";
+        player.reloadTimer = 0;
+    }
+
+    if (event.code === "KeyR") {
+        startReload();
+    }
+
+    if (event.code === "KeyF") {
+        meleeAttack();
+    }
+
+    if (event.code === "KeyG") {
+        throwGrenade();
+    }
+
+    if (event.code === "KeyZ") {
+        useMark();
+    }
+
+    if (event.code === "KeyX") {
+        useOverload();
+    }
+
+    if (event.code === "KeyC") {
+        deployMiniTurret();
+    }
+
+    if (event.code === "KeyQ") {
+        selectedTowerType = "mg";
+
+        if (phase().id === "deploy") {
+            addNotice("已选择重机枪塔", "#72dff4", 1);
+        }
+    }
+
+    if (event.code === "KeyE") {
+        selectedTowerType = "saw";
+
+        if (phase().id === "deploy") {
+            addNotice("已选择链锯拒止塔", "#f1ad68", 1);
+        }
+    }
+
+    if (event.code === "Enter") {
+        startDefense();
+    }
+
+    if (event.code === "KeyL") {
+        exportLog();
+    }
+
+    if (event.code === "KeyN") {
+        resetGame();
+    }
+
+    if (event.code === "F8") {
+        event.preventDefault();
+
+        const scales = [0.5, 1, 1.5, 2, 3];
+        const index = scales.indexOf(timeScale);
+
+        timeScale = scales[(index + 1) % scales.length];
+
+        addNotice(`时间倍率调整为 ×${timeScale}`, "#9be8ff", 1.5);
+    }
+
+    if (event.code === "F9") {
+        event.preventDefault();
+
+        if (
+            gameState === "playing" &&
+            phase().id !== "deploy"
+        ) {
+            enemies = [];
+            mortarWarnings = [];
+            nextPhase();
+        }
+    }
+});
+
+window.addEventListener("keyup", event => {
+    keys.delete(event.code);
+});
+
+canvas.addEventListener("mousemove", event => {
+    const p = screenToWorld(event.clientX, event.clientY);
+
+    mouse.x = p.x;
+    mouse.y = p.y;
+});
+
+canvas.addEventListener("mousedown", event => {
+    if (event.button !== 0) {
+        return;
+    }
+
+    mouse.down = true;
+
+    if (phase().id === "deploy") {
+        placeSelectedTower();
+    }
+});
+
+window.addEventListener("mouseup", event => {
+    if (event.button === 0) {
+        mouse.down = false;
+    }
+});
+
+canvas.addEventListener("contextmenu", event => {
+    event.preventDefault();
+});
+
+window.addEventListener("blur", () => {
+    keys.clear();
+    mouse.down = false;
+});
+
+/* =========================================================
+   22. 主循环
+   ========================================================= */
+
+function loop(now) {
+    const rawDt = Math.min(
+        (now - lastTime) / 1000,
+        0.05
+    );
+
+    lastTime = now;
+
+    update(rawDt * timeScale);
+    draw();
+
+    requestAnimationFrame(loop);
+}
+
+resetGame();
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>
